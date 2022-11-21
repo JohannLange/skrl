@@ -1,6 +1,6 @@
 from typing import Union, Tuple, Dict, Any, Optional
 
-import gym
+import gym, gymnasium
 import copy
 
 import torch
@@ -16,10 +16,10 @@ from .. import Agent
 LPVDDPG_DEFAULT_CONFIG = {
     "gradient_steps": 1,            # gradient steps
     "batch_size": 64,               # training batch size
-    
+
     "discount_factor": 0.99,        # discount factor (gamma)
     "polyak": 0.005,                # soft update hyperparameter (tau)
-    
+
     "actor_learning_rate": 1e-3,    # actor learning rate
     "critic_learning_rate": 1e-3,   # critic learning rate
     "learning_rate_scheduler": None,        # learning rate scheduler class (see torch.optim.lr_scheduler)
@@ -46,35 +46,37 @@ LPVDDPG_DEFAULT_CONFIG = {
         "write_interval": 250,      # TensorBoard writing interval (timesteps)
 
         "checkpoint_interval": 1000,        # interval for checkpoints (timesteps)
-        "checkpoint_policy_only": True,     # checkpoint for policy only
+        "store_separately": False,          # whether to store checkpoints separately
+
+        "wandb": False,             # whether to use Weights & Biases
+        "wandb_kwargs": {}          # wandb kwargs (see https://docs.wandb.ai/ref/python/init)
     }
 }
 
 
 class LPVDDPG(Agent):
-    def __init__(self, 
-                 models: Dict[str, Model], 
+    def __init__(self,
+                 models: Dict[str, Model],
                  memory: Optional[Union[Memory, Tuple[Memory]]] = None,
                  env: Optional[Wrapper] = None,
-                 observation_space: Union[int, Tuple[int], gym.Space, None] = None, 
-                 action_space: Union[int, Tuple[int], gym.Space, None] = None, 
+                 observation_space: Optional[Union[int, Tuple[int], gym.Space, gymnasium.Space]] = None,
+                 action_space: Optional[Union[int, Tuple[int], gym.Space, gymnasium.Space]] = None,
                  device: Union[str, torch.device] = "cuda:0",
-                 cfg=None
-                 ) -> None:
+                 cfg: Optional[dict] = None) -> None:
         """Deep Deterministic Policy Gradient (DDPG)
 
         https://arxiv.org/abs/1509.02971
-        
+
         :param models: Models used by the agent
         :type models: dictionary of skrl.models.torch.Model
         :param memory: Memory to storage the transitions.
-                       If it is a tuple, the first element will be used for training and 
+                       If it is a tuple, the first element will be used for training and
                        for the rest only the environment transitions will be added
         :type memory: skrl.memory.torch.Memory, list of skrl.memory.torch.Memory or None
         :param observation_space: Observation/state space or shape (default: None)
-        :type observation_space: int, tuple or list of integers, gym.Space or None, optional
+        :type observation_space: int, tuple or list of integers, gym.Space, gymnasium.Space or None, optional
         :param action_space: Action space or shape (default: None)
-        :type action_space: int, tuple or list of integers, gym.Space or None, optional
+        :type action_space: int, tuple or list of integers, gym.Space, gymnasium.Space or None, optional
         :param device: Computing device (default: "cuda:0")
         :type device: str or torch.device, optional
         :param cfg: Configuration dictionary
@@ -83,13 +85,12 @@ class LPVDDPG(Agent):
         :raises KeyError: If the models dictionary is missing a required key
         """
         _cfg = copy.deepcopy(LPVDDPG_DEFAULT_CONFIG)
-        if cfg is not None:
-            _cfg.update(cfg)
-        super().__init__(models=models, 
-                         memory=memory, 
-                         observation_space=observation_space, 
-                         action_space=action_space, 
-                         device=device, 
+        _cfg.update(cfg if cfg is not None else {})
+        super().__init__(models=models,
+                         memory=memory,
+                         observation_space=observation_space,
+                         action_space=action_space,
+                         device=device,
                          cfg=_cfg)
 
         # models
@@ -102,10 +103,13 @@ class LPVDDPG(Agent):
         self.env = env
 
         # checkpoint models
-        self.checkpoint_models = {"policy": self.policy} if self.checkpoint_policy_only else self.models
-        
+        self.checkpoint_modules["policy"] = self.policy
+        self.checkpoint_modules["target_policy"] = self.target_policy
+        self.checkpoint_modules["critic"] = self.critic
+        self.checkpoint_modules["target_critic"] = self.target_critic
+
         if self.target_policy is not None and self.target_critic is not None:
-            # freeze target networks with respect to optimizers (update via .update_parameters())
+        # freeze target networks with respect to optimizers (update via .update_parameters())
             self.target_policy.freeze_parameters(True)
             self.target_critic.freeze_parameters(True)
 
@@ -116,7 +120,7 @@ class LPVDDPG(Agent):
         # configuration
         self._gradient_steps = self.cfg["gradient_steps"]
         self._batch_size = self.cfg["batch_size"]
-        
+
         self._discount_factor = self.cfg["discount_factor"]
         self._polyak = self.cfg["polyak"]
 
@@ -125,7 +129,7 @@ class LPVDDPG(Agent):
         self._learning_rate_scheduler = self.cfg["learning_rate_scheduler"]
 
         self._state_preprocessor = self.cfg["state_preprocessor"]
-        
+
         self._random_timesteps = self.cfg["random_timesteps"]
         self._learning_starts = self.cfg["learning_starts"]
 
@@ -135,7 +139,7 @@ class LPVDDPG(Agent):
         self._exploration_timesteps = self.cfg["exploration"]["timesteps"]
 
         self._rewards_shaper = self.cfg["rewards_shaper"]
-        
+
         # set up optimizers and learning rate schedulers
         if self.policy is not None and self.critic is not None:
             self.policy_optimizer = torch.optim.Adam(self.policy.parameters(), lr=self._actor_learning_rate)
@@ -144,24 +148,30 @@ class LPVDDPG(Agent):
                 self.policy_scheduler = self._learning_rate_scheduler(self.policy_optimizer, **self.cfg["learning_rate_scheduler_kwargs"])
                 self.critic_scheduler = self._learning_rate_scheduler(self.critic_optimizer, **self.cfg["learning_rate_scheduler_kwargs"])
 
-        # set up preprocessors
-        self._state_preprocessor = self._state_preprocessor(**self.cfg["state_preprocessor_kwargs"]) if self._state_preprocessor \
-            else self._empty_preprocessor
+        self.checkpoint_modules["policy_optimizer"] = self.policy_optimizer
+        self.checkpoint_modules["critic_optimizer"] = self.critic_optimizer
 
-    def init(self) -> None:
+        # set up preprocessors
+        if self._state_preprocessor:
+            self._state_preprocessor = self._state_preprocessor(**self.cfg["state_preprocessor_kwargs"])
+            self.checkpoint_modules["state_preprocessor"] = self._state_preprocessor
+        else:
+            self._state_preprocessor = self._empty_preprocessor
+
+    def init(self, trainer_cfg: Optional[Dict[str, Any]] = None) -> None:
         """Initialize the agent
         """
-        super().init()
-        
+        super().init(trainer_cfg=trainer_cfg)
+
         # create tensors in memory
         if self.memory is not None:
             self.memory.create_tensor(name="states", size=self.observation_space, dtype=torch.float32)
             self.memory.create_tensor(name="next_states", size=self.observation_space, dtype=torch.float32)
             self.memory.create_tensor(name="actions", size=self.action_space, dtype=torch.float32)
             self.memory.create_tensor(name="rewards", size=1, dtype=torch.float32)
-            self.memory.create_tensor(name="dones", size=1, dtype=torch.bool)
+            self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
 
-        self.tensors_names = ["states", "actions", "rewards", "next_states", "dones"]
+        self.tensors_names = ["states", "actions", "rewards", "next_states", "terminated"]
 
         # clip noise bounds
         self.clip_actions_min = torch.tensor(self.action_space.low, device=self.device)
@@ -170,10 +180,10 @@ class LPVDDPG(Agent):
         # backward compatibility: torch < 1.9 clamp method does not support tensors
         self._backward_compatibility = tuple(map(int, (torch.__version__.split(".")[:2]))) < (1, 9)
 
-    def act(self, 
-            states: torch.Tensor, 
-            timestep: int, 
-            timesteps: int, 
+    def act(self,
+            states: torch.Tensor,
+            timestep: int,
+            timesteps: int,
             inference: bool = False) -> torch.Tensor:
         """Process the environment's states to make a decision (actions) using the main policy
 
@@ -197,18 +207,18 @@ class LPVDDPG(Agent):
             return torch.tensor(self.env._env.unwrapped.optimal_action, device=self.device, dtype=states.dtype), None, None
 
         # sample deterministic actions
-        actions = self.policy.act(states, inference=inference)
+        actions = self.policy.act(states, taken_actions=None, role="policy")
 
         # add exloration noise
         if self._exploration_noise is not None:
             # sample noises
             noises = self._exploration_noise.sample(actions[0].shape)
-            
+
             # define exploration timesteps
             scale = self._exploration_final_scale
             if self._exploration_timesteps is None:
                 self._exploration_timesteps = timesteps
-            
+
             # apply exploration noise
             if timestep <= self._exploration_timesteps:
                 scale = (1 - timestep / self._exploration_timesteps) \
@@ -219,8 +229,8 @@ class LPVDDPG(Agent):
                 # modify actions
                 actions[0].add_(noises)
                 if self._backward_compatibility:
-                    actions = (torch.max(torch.min(actions[0], self.clip_actions_max), self.clip_actions_min), 
-                               actions[1], 
+                    actions = (torch.max(torch.min(actions[0], self.clip_actions_max), self.clip_actions_min),
+                               actions[1],
                                actions[2])
                 else:
                     actions[0].clamp_(min=self.clip_actions_min, max=self.clip_actions_max)
@@ -229,26 +239,27 @@ class LPVDDPG(Agent):
                 self.track_data("Exploration / Exploration noise (max)", torch.max(noises).item())
                 self.track_data("Exploration / Exploration noise (min)", torch.min(noises).item())
                 self.track_data("Exploration / Exploration noise (mean)", torch.mean(noises).item())
-            
+
             else:
                 # record noises
                 self.track_data("Exploration / Exploration noise (max)", 0)
                 self.track_data("Exploration / Exploration noise (min)", 0)
                 self.track_data("Exploration / Exploration noise (mean)", 0)
-        
+
         return actions
 
-    def record_transition(self, 
-                          states: torch.Tensor, 
-                          actions: torch.Tensor, 
-                          rewards: torch.Tensor, 
-                          next_states: torch.Tensor, 
-                          dones: torch.Tensor, 
-                          infos: Any, 
-                          timestep: int, 
+    def record_transition(self,
+                          states: torch.Tensor,
+                          actions: torch.Tensor,
+                          rewards: torch.Tensor,
+                          next_states: torch.Tensor,
+                          terminated: torch.Tensor,
+                          truncated: torch.Tensor,
+                          infos: Any,
+                          timestep: int,
                           timesteps: int) -> None:
         """Record an environment transition in memory
-        
+
         :param states: Observations/states of the environment used to make the decision
         :type states: torch.Tensor
         :param actions: Actions taken by the agent
@@ -257,8 +268,10 @@ class LPVDDPG(Agent):
         :type rewards: torch.Tensor
         :param next_states: Next observations/states of the environment
         :type next_states: torch.Tensor
-        :param dones: Signals to indicate that episodes have ended
-        :type dones: torch.Tensor
+        :param terminated: Signals to indicate that episodes have terminated
+        :type terminated: torch.Tensor
+        :param truncated: Signals to indicate that episodes have been truncated
+        :type truncated: torch.Tensor
         :param infos: Additional information about the environment
         :type infos: Any type supported by the environment
         :param timestep: Current timestep
@@ -266,16 +279,18 @@ class LPVDDPG(Agent):
         :param timesteps: Number of timesteps
         :type timesteps: int
         """
-        super().record_transition(states, actions, rewards, next_states, dones, infos, timestep, timesteps)
+        super().record_transition(states, actions, rewards, next_states, terminated, truncated, infos, timestep, timesteps)
 
-        # reward shaping
-        if self._rewards_shaper is not None:
-            rewards = self._rewards_shaper(rewards, timestep, timesteps)
-        
         if self.memory is not None:
-            self.memory.add_samples(states=states, actions=actions, rewards=rewards, next_states=next_states, dones=dones)
+            # reward shaping
+            if self._rewards_shaper is not None:
+                rewards = self._rewards_shaper(rewards, timestep, timesteps)
+
+            self.memory.add_samples(states=states, actions=actions, rewards=rewards, next_states=next_states,
+                                    terminated=terminated, truncated=truncated)
             for memory in self.secondary_memories:
-                memory.add_samples(states=states, actions=actions, rewards=rewards, next_states=next_states, dones=dones)
+                memory.add_samples(states=states, actions=actions, rewards=rewards, next_states=next_states,
+                                   terminated=terminated, truncated=truncated)
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
         """Callback called before the interaction with the environment
@@ -321,24 +336,24 @@ class LPVDDPG(Agent):
 
             # compute target values
             with torch.no_grad():
-                next_actions, _, _ = self.target_policy.act(states=sampled_next_states)
-                
-                target_q_values, _, _ = self.target_critic.act(states=sampled_next_states, taken_actions=next_actions)
+                next_actions, _, _ = self.target_policy.act(states=sampled_next_states, taken_actions=None, role="target_policy")
+
+                target_q_values, _, _ = self.target_critic.act(states=sampled_next_states, taken_actions=next_actions, role="target_critic")
                 target_values = sampled_rewards + self._discount_factor * sampled_dones.logical_not() * target_q_values
 
             # compute critic loss
-            critic_values, _, _ = self.critic.act(states=sampled_states, taken_actions=sampled_actions)
-            
+            critic_values, _, _ = self.critic.act(states=sampled_states, taken_actions=sampled_actions, role="critic")
+
             critic_loss = F.mse_loss(critic_values, target_values)
-            
+
             # optimization step (critic)
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
             self.critic_optimizer.step()
 
             # compute policy (actor) loss
-            actions, _, _ = self.policy.act(states=sampled_states)
-            critic_values, _, _ = self.critic.act(states=sampled_states, taken_actions=actions)
+            actions, _, _ = self.policy.act(states=sampled_states, taken_actions=None, role="policy")
+            critic_values, _, _ = self.critic.act(states=sampled_states, taken_actions=actions, role="critic")
 
             policy_loss = -critic_values.mean()
 
